@@ -1,7 +1,7 @@
 ##  Place input data files into /data folder
 
-hhdata <- getDATRAS(record = "HH", survey = "NS-IBTS", years = 2012:2022, quarters = 3)
-hldata <- getDATRAS(record = "HL", survey = "NS-IBTS", years = 2012:2022, quarters = 3)
+hhdata <- getDATRAS(record = "HH", survey = "NS-IBTS", years = min.year:max.year, quarters = 3)
+hldata <- getDATRAS(record = "HL", survey = "NS-IBTS", years = min.year:max.year, quarters = 3)
 
 # cadata <- getDATRAS(record = "CA", survey = "NS-IBTS", years = 2022, quarters = 3)
 ## I don't think we need catch at age data for this work
