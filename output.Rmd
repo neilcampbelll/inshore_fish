@@ -1,0 +1,309 @@
+---
+title: "Scottish Coast Small Fish Index"
+author: "Neil Campbell"
+date: "`r format(Sys.time(), '%H:%M %d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(icesDatras)
+library(FSA)
+library(mgcv)
+library(ggplot2)
+library(jsonlite) #https://cran.r-project.org/web/packages/jsonlite/
+library(httr)
+library(raster)
+library(exactextractr)
+library(DT)
+library(xtable)
+library(itsadug)
+
+
+min.year <- 2012
+max.year <- 2023
+
+length.threshold <- 20
+
+hldata <- read.csv("data/hldata.csv")
+
+hauls <- read.table("hauls.csv", sep = ";")
+hauls <- st_as_sf(hauls, coords = c("ShootLong", "ShootLat"), crs = st_crs(4326), remove = FALSE)
+hauls <- hauls[!is.na(hauls$log.s),]
+hauls <-hauls[hauls$ShootLat!= -9,]
+hauls <-hauls[hauls$ShootLon!= -9,]
+coastline <- st_read("data/Europe_coastline.shp")
+coastline <- st_transform(coastline, crs = 4326)
+hauls <- st_transform(hauls, crs = 4326)
+c.buff <- read_sf("data/ICES_Divs_4ab_COASTAL.shp")
+
+model.data.s <- hauls %>% 
+  dplyr::select(c("Ship", "Year", "ShootLong","ShootLat", "Depth", "log.s"))
+model.data.s$Year <- as.numeric(model.data.s$Year)
+model.data.s$ShootLong <- as.numeric(model.data.s$ShootLong)
+model.data.s$ShootLat <- as.numeric(model.data.s$ShootLat)
+model.data.s$log.s <- as.numeric(model.data.s$log.s)
+model.data.s$log.s.std <- model.data.s$log.s/mean(model.data.s$log.s, na.rm=T)
+
+
+
+```
+
+# Developing a Time-Series Index of Small Fish Abundance Along the Scottish Coast
+## Data
+
+This document describes the data used, analysis and outputs of an attempt to model abundance of small fish in the North Sea during summer, and what proportion of that biomass might be available to birds foraging in coastal waters (roughly 30 miles offshore). Data is taken from the ICES DATRAS database of trawl surveys, for all vessels participating in the North Sea International Bottom Trawl Survey (NS-IBTS). The current analysis used data gathered between 2012 and 2022. This period can be easily altered using the max.year and min.year parameters. When 2023 data becomes available this too can easily be added.  
+
+A shapefile of the UK Coastline was downloaded from the DIVA-GIS website (http://www.diva-gis.org/gdata), and buffered to a distance of 0.5 degrees (approx. 30 miles at 60°N) using QGIS. A shapefile of ICES Divisions was downloaded from the Marine Regions website (https://www.marineregions.org/). Subareas 4a and 4b, corresponding to the northern and central North Sea were extracted from this shapefile, representing the background area of interest, and used to clip the buffered UK coastline to a shape giving the 30 mile coastal waters of the east coast of the UK, stretching from the Humber to Shetland. Both clipped layers were exported to the data folder of the project.  
+
+```{r coastal_polygon, echo = FALSE, fig.cap = "Area used as coastal waters"}
+
+plot(c.buff['ID_0'], main = "Coastal Area")
+
+```
+
+## Methods
+
+Data was analysed in R version 4.3.1, using RStudio (2023.09.0+463), and the `sf`, `dplyr` and `icesDATRAS` libraries. Code is available on github at https://github.com/neilcampbelll/inshore_fish/  
+
+A decision was made to consider fish <= 20cm in total length as "small fish", and anything larger to be "large fish". The reasoning being the relative availability of the two size classes to feeding seabirds.
+
+
+## Data Exploration
+
+Firstly lets look at the distribution of data over time and space. I have filtered the hauls for those within roughly 30 miles of the coast.
+
+```{r exploratory_maps, echo=FALSE, fig.cap="Distribtuion of survey hauls in Scottish coastal waters (2012 - 2023)."}
+
+  test <- hauls %>%
+  dplyr::select(Year, log.s, geometry)
+
+  test <- st_join(test, c.buff, join = st_within)
+  test <- test[!is.na(test$ID_0),]
+  test <- test %>%
+    dplyr::select(Year, log.s, geometry)
+
+(g <- ggplot(test) +
+  geom_sf() + ylim(c(54, 63)) + xlim(c(-4,0)) +
+  geom_sf(data = coastline) +
+  facet_wrap(vars(Year), nrow = 2))
+
+```  
+
+
+Hauls seem to be representative of the area, and spread relatively randomly. Coverage along the Northumberland coast is not so good in all years, but most of the area is well sampled.
+
+```{r summary_stats, echo = FALSE, fig.cap = "Summary of hauls in coastal waters - mean catch of fish <= 20cm, by year, +/- 2s.e."}
+
+res.tab <- plyr::count(test$Year)
+names(res.tab)[1:2] <- c("Year", "No. Hauls")
+res.tab$log.mean.n <- tapply(test$log.s, test$Year, mean)
+res.tab$sd <- tapply(test$log.s, test$Year, sd)
+res.tab$se <- res.tab$sd / sqrt(res.tab$"No. Hauls")
+res.tab$mean.n <- round(exp(res.tab$log.mean.n), 0)
+res.tab$log.upper <- res.tab$log.mean.n + (2 * res.tab$se)
+res.tab$log.lower <- res.tab$log.mean.n - (2 * res.tab$se)
+res.tab$upper <-round(exp(res.tab$log.upper), 0)
+res.tab$lower <-round(exp(res.tab$log.lower), 0)
+res.tab <- round(res.tab, 3)
+
+knitr::kable(res.tab)
+
+```
+
+
+```{r simple_plot, echo = FALSE, fig.cap = "Mean numbers of fish <=20cm per hour, in Scottish coastal waters, 2012 - 2023."}
+  p <- ggplot(res.tab, aes(x=Year)) + ylim(0,25000) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "orange") + 
+  ylab("Number of small fish per hour") +
+  geom_line(aes(y = mean.n), color ="orange", lwd =1) + 
+  scale_x_continuous(limits = c(min.year, max.year))
+print(p)
+
+```  
+
+Clearly the numbers of small fish in hauls along the Scottish coast has fallen to very low levels in recent years.
+
+Plots of the standardised catch per unit effort (CPUE) for all North Sea hauls suggest a general pattern whereby small fish are relatively more abundant on the Norwegian coast and in the Skaggerak and Kattegat, while larger fish are more abundant in the northwestern North Sea, along the Scottish coast.  
+
+A quick exploratory boxplot suggests some kind of discontinuity of data after 2020, with a sudden drop in the median and interquartile ranges, compared to previous years. This pattern is repeated in 2022 and 2023.
+
+```{r small_fish_CPUE_over_time, echo = FALSE, fig.cap="Boxplot of small fish CPUE across the North Sea Q3 IBTS survey, by year."}
+p<-ggplot(model.data.s, aes(Year, log.s)) +
+  geom_boxplot(aes(group = Year)) +
+  scale_x_continuous(name="Year") + ylab("Log CPUE (no. <=20cm per hour)")
+print(p)
+```
+
+
+Next, we can explore spatial aspects of the distribution of small fish. The plots below show logged catch per unit effort (ie. logged numbers of fish <= 20cm per hour fished) for each year in 2012 - 2023, standardised to the series mean.
+
+
+
+
+```{r small_fish_CPUE_older_two, echo=FALSE, fig.cap="Small fish CPUE in the North Sea Q3 IBTS survey (lengths corrected) standardised to series mean, by year (2012 - 2017)."}
+
+f.year <- model.data.s %>%
+  filter(Year %in% c(2012:2017))
+f.year$Year <- paste(f.year$Year)
+
+smallmap <- ggplot() +
+  geom_sf(data = coastline) +
+  geom_point(data = f.year, aes(x = ShootLong, y = ShootLat, colour = log.s.std), pch = 16, alpha = 0.5)+
+  xlim(c(-6, 16)) + ylim(c(50, 63)) + facet_wrap(vars(Year), nrow = 2) +
+  scale_colour_gradient2(low="green", mid = "yellow", high="red", midpoint = 1, limits = c(0.3,1.8))
+
+print(smallmap)
+
+```
+
+
+```{r small_fish_CPUE_newer_two, echo=FALSE, fig.cap="Small fish CPUE in the North Sea Q3 IBTS survey (lengths corrected) standardised to series mean, by year (2018 - 2023)."}
+
+
+f.year <- model.data.s %>%
+  filter(Year %in% c(2018:2023))
+f.year$Year <- paste(f.year$Year)
+
+smallmap <- ggplot() +
+  geom_sf(data = coastline) +
+  geom_point(data = f.year, aes(x = ShootLong, y = ShootLat, colour = log.s.std), pch = 16, alpha = 0.5)+   xlim(c(-6, 16)) + ylim(c(50, 63)) + facet_wrap(vars(Year), nrow = 2) +
+  scale_colour_gradient2(low="green", mid = "yellow", high="red", midpoint = 1, limits = c(0.3,1.8))
+
+print(smallmap)
+
+
+```
+
+These plots show that in all years there is a high concentration of small fish in the Skaggerak and Kattegat, along the Swedish and Danish coasts. In most years there is a further concentration of small fish in the southern North Sea, in the area roughly corresponding to shallower than the 100m isobath. In earlier years there are significant numbers of hauls above the long-term average around the Moray Firth and up towards Orkney and Shetland. Such hauls are absent from these areas in 2021 - 2023.
+
+***
+
+
+###
+
+Here are plots of the size-spectra of the data set, broken down by year.
+
+```{r change_length_classes,echo = FALSE, fig.cap= "Exploration of size spectra in the NS-IBTS Q3 data. Lengths have been corrected to align species measured to 0.5cm and to mm.", message=FALSE, warning=FALSE}
+
+## convert the 0.5cm intervals for HER and SPR, and all the species measured to the mm
+
+ss <- hldata %>%
+  dplyr::select(Year, new.length, HLNoAtLngt) %>%
+  group_by(Year, new.length) %>%
+  summarise(NoAtLength = sum(HLNoAtLngt))
+
+
+p <- ggplot(ss, aes(x = new.length, y = log(NoAtLength))) +
+      geom_point() + facet_wrap(vars(Year)) + xlim(c(0, 150))
+print(p)
+```
+
+
+Fish at lengths <7cm seem to be unavailable to, or poorly selected by the gear, which is not too surprising, and remains constant across years. The "y-intercept" of these graphs is a proxy for the productivity of the system, while the slope is a measure of the mortality the community is experiencing. You can see the "peak" in 2021 is much lower than in surrounding years, which fits with the idea that this year saw unusually low numbers of small fish across the North Sea.
+
+***
+
+## Spatial Model
+
+Normally I would run this as a two-stage model, modelling presence/absence first, and then modelling abundance where present. As we have binned all fish species into a single category of "small fish" there are no hauls where zeroes are recorded, which is perhaps unsurprising. We will therefore model the abundace of small fish as a funtion of year, and a smooth of latitude, longitude. I removed depth as it correlates with long and lat (the North Sea gets deeper as you go north, and east or west towards the Norwegain Trench) and vessel (ideally, all ships are using the same gear in the same way, so numbers per hour should be comparable.
+
+```{r spatial_model, echo = FALSE, message = FALSE, error = FALSE, results='hide',fig.keep='all', label = "Diagnostic plots for the spatial model fitted to small fish CPUEs"}
+
+CPUE.data<-model.data.s
+CPUE.data$s <-round(exp(CPUE.data$log.s),0)
+gam.cpue.xvars<-c("Ship", "Year", "ShootLong","ShootLat","Depth")
+gam.cpue.form <- as.formula(paste("CPUE.data$s ~ s(ShootLong, ShootLat, by= as.factor(Year))",sep=""))
+cpue.gam <- gam(gam.cpue.form, family = poisson(link = "log"), data =CPUE.data)
+
+gamtabs(cpue.gam, caption = "Summary of GAM fitted to CPUE data")
+(mgcv::plot.gam(cpue.gam))
+
+ 
+```
+
+The model can be used to predict numbers of small fish caught per hour in NS-IBTS tows over time. In this case, I asked it to predict numbers of small fish expected at a station in the Moray Firth (58N, 3W), over 2012-23.
+
+```{r model_outputs, echo = FALSE, message = FALSE, error = FALSE, label = "Modelled CPUE of small fish in the Moray Firth, 2012 - 2023"}
+
+new.data <-data.frame(Year = 2012:2023, ShootLong = -3, ShootLat = 58, Depth = 75, Ship = "748S")
+
+model.fit <- predict(cpue.gam, new.data, se =T)
+
+model.results <- data.frame(Year = min.year:max.year, nph = exp(model.fit$fit),
+                            lower.nph = exp(model.fit$fit - (2 * model.fit$se.fit)),
+                            upper.nph = exp(model.fit$fit + (2 * model.fit$se.fit)))
+
+
+p <- ggplot(model.results, aes(x=Year)) + ylim(0,50000) +
+      geom_ribbon(aes(ymin = lower.nph, ymax = upper.nph), alpha = 0.2, fill = "orange") + 
+      ylab("Number of small fish per hour") +
+      geom_line(aes(y = nph), color ="orange", lwd =1) + 
+      scale_x_continuous(limits = c(min.year, max.year))
+print(p)
+
+```
+
+Below, I have mapped the modelled CPUE of small fish in 2021
+
+```{r scottish_spatial_model, echo = FALSE,  results='hide',fig.keep='all', fig.cap = "Modelled CPUE in 2019 - 2021 for Scottish waters, 0.1 degree cells"}
+fishnet <- st_make_grid(st_transform(c.buff, crs=st_crs(4326)),cellsize = 0.1)
+fishnet <- fishnet[c.buff]
+c.cnt <- st_centroid(fishnet)
+
+mybreaks <- seq(0, 13, by = 1)
+
+i <- 2019
+
+new.data <- as.data.frame(st_coordinates(c.cnt))
+  
+names(new.data)<-c ("ShootLong", "ShootLat")
+  
+new.data$Year <- i
+
+new.data$model.fit <- predict(cpue.gam, new.data, se =F)
+
+new.data <- new.data[,-3]
+new.data.sp <- st_as_sf(new.data, coords = c("ShootLong", "ShootLat"))
+
+p <- plot(new.data.sp, pch = 15, breaks = mybreaks, main = i)
+
+print(p)
+
+i <- 2020
+
+new.data <- as.data.frame(st_coordinates(c.cnt))
+  
+names(new.data)<-c ("ShootLong", "ShootLat")
+  
+new.data$Year <- i
+
+new.data$model.fit <- predict(cpue.gam, new.data, se =F)
+
+new.data <- new.data[,-3]
+new.data.sp <- st_as_sf(new.data, coords = c("ShootLong", "ShootLat"))
+
+p <- plot(new.data.sp, pch = 15, breaks = mybreaks, main = i)
+
+print(p)
+
+i <- 2021
+
+new.data <- as.data.frame(st_coordinates(c.cnt))
+  
+names(new.data)<-c ("ShootLong", "ShootLat")
+  
+new.data$Year <- i
+
+new.data$model.fit <- predict(cpue.gam, new.data, se =F)
+
+new.data <- new.data[,-3]
+new.data.sp <- st_as_sf(new.data, coords = c("ShootLong", "ShootLat"))
+
+p <- plot(new.data.sp, pch = 15, breaks = mybreaks, main = i)
+
+print(p)
+```
+
